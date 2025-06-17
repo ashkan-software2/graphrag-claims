@@ -17,7 +17,7 @@ import annotated_types
 from pydantic import PositiveInt, validate_call
 
 from graphrag.callbacks.noop_workflow_callbacks import NoopWorkflowCallbacks
-from graphrag.config.defaults import graphrag_config_defaults
+from graphrag.config.defaults import graphrag_config_defaults, language_model_defaults
 from graphrag.config.models.graph_rag_config import GraphRagConfig
 from graphrag.language_model.manager import ModelManager
 from graphrag.logger.base import ProgressLogger
@@ -33,7 +33,7 @@ from graphrag.prompt_tune.generator.community_reporter_role import (
 )
 from graphrag.prompt_tune.generator.domain import generate_domain
 from graphrag.prompt_tune.generator.entity_relationship import (
-    generate_entity_relationship_examples,
+    generate_entity_relationship_examples, generate_community_reporter_examples
 )
 from graphrag.prompt_tune.generator.entity_summarization_prompt import (
     create_entity_summarization_prompt,
@@ -52,6 +52,7 @@ from graphrag.prompt_tune.types import DocSelectionType
 async def generate_indexing_prompts(
     config: GraphRagConfig,
     logger: ProgressLogger,
+    root: str,
     chunk_size: PositiveInt = graphrag_config_defaults.chunks.size,
     overlap: Annotated[
         int, annotated_types.Gt(-1)
@@ -92,6 +93,7 @@ async def generate_indexing_prompts(
     # Retrieve documents
     logger.info("Chunking documents...")
     doc_list = await load_docs_in_chunks(
+        root=root,
         config=config,
         limit=limit,
         select_method=selection_method,
@@ -106,6 +108,15 @@ async def generate_indexing_prompts(
     # TODO: Expose a way to specify Prompt Tuning model ID through config
     logger.info("Retrieving language model configuration...")
     default_llm_settings = config.get_language_model_config(PROMPT_TUNING_MODEL_ID)
+
+    # if max_retries is not set, inject a dynamically assigned value based on the number of expected LLM calls
+    # to be made or fallback to a default value in the worst case
+    if default_llm_settings.max_retries == -1:
+        default_llm_settings.max_retries = min(
+            len(doc_list), language_model_defaults.max_retries
+        )
+        msg = f"max_retries not set, using default value: {default_llm_settings.max_retries}"
+        logger.warning(msg)
 
     logger.info("Creating language model...")
     llm = ModelManager().register_chat(
@@ -179,11 +190,23 @@ async def generate_indexing_prompts(
         llm, domain=domain, persona=persona, docs=doc_list
     )
 
+    community_reporter_examples = await generate_community_reporter_examples(
+        llm,
+        persona=persona,
+        entity_relationship_examples = examples,
+        community_reporter_role = community_reporter_role,
+        report_rating_description= community_report_ranking,
+        docs=doc_list,
+        language=language,
+        json_mode=False,  # config.llm.model_supports_json should be used, but these prompts are used in non-json mode by the index engine
+    )
+
     logger.info("Generating community summarization prompt...")
     community_summarization_prompt = create_community_summarization_prompt(
         persona=persona,
         role=community_reporter_role,
         report_rating_description=community_report_ranking,
+        community_reporter_examples=community_reporter_examples,
         language=language,
     )
 
